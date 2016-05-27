@@ -21,7 +21,7 @@ from tempfile import NamedTemporaryFile
 import teuthology
 import matrix
 from . import lock
-from .config import config, JobConfig
+from .config import config, JobConfig, FakeNamespace
 from .exceptions import BranchNotFoundError, CommitNotFoundError, ScheduleFailError
 from .misc import deep_merge, get_results_url
 from .orchestra.opsys import OS
@@ -34,43 +34,46 @@ from .task.install import get_flavor
 log = logging.getLogger(__name__)
 
 
-def main(args):
-    verbose = args['--verbose']
-    if verbose:
-        teuthology.log.setLevel(logging.DEBUG)
-    dry_run = args['--dry-run']
+def process_args(args):
+    fn = FakeNamespace()
+    rename_args = {
+        'ceph': 'ceph_branch',
+        'sha1': 'ceph_sha1',
+        'kernel': 'kernel_branch',
+        # FIXME: ceph flavor and kernel flavor are separate things
+        'flavor': 'kernel_flavor',
+        '<config_yaml>': 'base_yaml_paths',
+        'filter': 'filter_in',
+    }
+    for (key, value) in args.iteritems():
+        # Translate --foo-bar to foo_bar
+        key = key.lstrip('--').replace('-', '_')
+        # Rename the key if necessary
+        key = rename_args.get(key) or key
+        if key == 'suite':
+            value = value.replace('/', ':')
+        elif key in ('limit', 'priority', 'num'):
+            value = int(value)
+        fn[key] = value
+    return fn
 
-    base_yaml_paths = args['<config_yaml>']
-    suite = args['--suite'].replace('/', ':')
-    ceph_branch = args['--ceph']
-    ceph_sha1 = args['--sha1']
-    kernel_branch = args['--kernel']
-    kernel_flavor = args['--flavor']
-    teuthology_branch = args['--teuthology-branch']
-    machine_type = args['--machine-type']
-    if not machine_type or machine_type == 'None':
+
+def main(args):
+    fn = process_args(args)
+    if fn.verbose:
+        teuthology.log.setLevel(logging.DEBUG)
+
+    if not fn.machine_type or fn.machine_type == 'None':
         schedule_fail("Must specify a machine_type")
-    elif 'multi' in machine_type:
+    elif 'multi' in fn.machine_type:
         schedule_fail("'multi' is not a valid machine_type. " +
                       "Maybe you want 'plana,mira,burnupi' or similar")
-    distro = args['--distro']
-    suite_branch = args['--suite-branch']
-    suite_dir = args['--suite-dir']
 
-    limit = int(args['--limit'])
-    priority = int(args['--priority'])
-    num = int(args['--num'])
-    owner = args['--owner']
-    email = args['--email']
-    if email:
-        config.results_email = email
+    if fn.email:
+        config.results_email = fn.email
     if args['--archive-upload']:
         config.archive_upload = args['--archive-upload']
         log.info('Will upload archives to ' + args['--archive-upload'])
-    timeout = args['--timeout']
-    filter_in = args['--filter']
-    filter_out = args['--filter-out']
-    throttle = args['--throttle']
 
     subset = None
     if args['--subset']:
@@ -78,30 +81,29 @@ def main(args):
         subset = tuple(map(int, args['--subset'].split('/')))
         log.info('Passed subset=%s/%s' % (str(subset[0]), str(subset[1])))
 
-    run = Run(suite, suite_branch, ceph_branch, ceph_sha1, teuthology_branch,
-              kernel_branch, kernel_flavor, distro, machine_type)
+    run = Run(fn)
     job_config = run.base_config
     name = run.name
 
-    if suite_dir:
-        suite_repo_path = suite_dir
+    if fn.suite_dir:
+        suite_repo_path = fn.suite_dir
     else:
         suite_repo_path = fetch_repos(job_config.suite_branch, test_name=name)
 
     job_config.name = name
-    job_config.priority = priority
+    job_config.priority = fn.priority
     if config.results_email:
         job_config.email = config.results_email
-    if owner:
-        job_config.owner = owner
+    if fn.owner:
+        job_config.owner = fn.owner
 
-    if dry_run:
+    if fn.dry_run:
         log.debug("Base job config:\n%s" % job_config)
 
     # Interpret any relative paths as being relative to ceph-qa-suite (absolute
     # paths are unchanged by this)
     base_yaml_paths = [os.path.join(suite_repo_path, b) for b in
-                       base_yaml_paths]
+                       fn.base_yaml_paths]
 
     with NamedTemporaryFile(prefix='schedule_suite_',
                             delete=False) as base_yaml:
@@ -111,18 +113,18 @@ def main(args):
     prepare_and_schedule(job_config=job_config,
                          suite_repo_path=suite_repo_path,
                          base_yaml_paths=base_yaml_paths,
-                         limit=limit,
-                         num=num,
-                         timeout=timeout,
-                         dry_run=dry_run,
-                         verbose=verbose,
-                         filter_in=filter_in,
-                         filter_out=filter_out,
+                         limit=fn.limit,
+                         num=fn.num,
+                         timeout=fn.timeout,
+                         dry_run=fn.dry_run,
+                         verbose=fn.verbose,
+                         filter_in=fn.filter_in,
+                         filter_out=fn.filter_out,
                          subset=subset,
-                         throttle=throttle,
+                         throttle=fn.throttle,
                          )
     os.remove(base_yaml_path)
-    if not dry_run and args['--wait']:
+    if not fn.dry_run and args['--wait']:
         return wait(name, config.max_job_time,
                     args['--archive-upload-url'])
 
@@ -131,17 +133,20 @@ class Run(object):
     WAIT_MAX_JOB_TIME = 30 * 60
     WAIT_PAUSE = 5 * 60
 
-    def __init__(self, suite, suite_branch=None, ceph_branch=None,
-                 ceph_sha1=None, teuthology_branch=None, kernel_branch=None,
-                 flavor=None, distro=None, machine_type=None):
+    def __init__(self, args):
+        """
+        args must be a config.FakeNamespace object
+        """
         self.name = self.make_run_name(
-            suite, ceph_branch, kernel_branch, flavor, machine_type,
+            args.suite, args.ceph_branch, args.kernel_branch,
+            args.kernel_flavor, args.machine_type,
         )
         self.base_config = self.create_initial_config(
-            suite, suite_branch, ceph_branch, ceph_sha1, teuthology_branch,
-            kernel_branch, flavor, distro, machine_type, self.name,
+            args.suite, args.suite_branch, args.ceph_branch, args.ceph_sha1,
+            args.teuthology_branch, args.kernel_branch, args.kernel_flavor,
+            args.distro, args.machine_type, self.name,
         )
-        pass
+        self.args = args
 
     @staticmethod
     def make_run_name(suite, ceph_branch, kernel_branch, kernel_flavor,
