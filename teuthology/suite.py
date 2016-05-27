@@ -13,8 +13,7 @@ import subprocess
 import smtplib
 import socket
 import sys
-from time import sleep
-from time import time
+import time
 import yaml
 from email.mime.text import MIMEText
 from tempfile import NamedTemporaryFile
@@ -79,13 +78,10 @@ def main(args):
         subset = tuple(map(int, args['--subset'].split('/')))
         log.info('Passed subset=%s/%s' % (str(subset[0]), str(subset[1])))
 
-    name = make_run_name(suite, ceph_branch, kernel_branch, kernel_flavor,
-                         machine_type)
-
-    job_config = create_initial_config(suite, suite_branch, ceph_branch,
-                                       ceph_sha1, teuthology_branch,
-                                       kernel_branch, kernel_flavor, distro,
-                                       machine_type, name)
+    run = Run(suite, suite_branch, ceph_branch, ceph_sha1, teuthology_branch,
+              kernel_branch, kernel_flavor, distro, machine_type)
+    job_config = run.base_config
+    name = run.name
 
     if suite_dir:
         suite_repo_path = suite_dir
@@ -130,20 +126,178 @@ def main(args):
         return wait(name, config.max_job_time,
                     args['--archive-upload-url'])
 
-WAIT_MAX_JOB_TIME = 30 * 60
-WAIT_PAUSE = 5 * 60
+
+class Run(object):
+    WAIT_MAX_JOB_TIME = 30 * 60
+    WAIT_PAUSE = 5 * 60
+
+    def __init__(self, suite, suite_branch=None, ceph_branch=None,
+                 ceph_sha1=None, teuthology_branch=None, kernel_branch=None,
+                 flavor=None, distro=None, machine_type=None):
+        self.name = self.make_run_name(
+            suite, ceph_branch, kernel_branch, flavor, machine_type,
+        )
+        self.base_config = self.create_initial_config(
+            suite, suite_branch, ceph_branch, ceph_sha1, teuthology_branch,
+            kernel_branch, flavor, distro, machine_type, self.name,
+        )
+        pass
+
+    @staticmethod
+    def make_run_name(suite, ceph_branch, kernel_branch, kernel_flavor,
+                      machine_type, user=None, timestamp=None):
+        """
+        Generate a run name based on the parameters. A run name looks like:
+            teuthology-2014-06-23_19:00:37-rados-dumpling-testing-basic-plana
+        """
+        if not user:
+            user = pwd.getpwuid(os.getuid()).pw_name
+        # We assume timestamp is a datetime.datetime object
+        if not timestamp:
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+
+        worker = get_worker(machine_type)
+        return '-'.join(
+            [
+                user, str(timestamp), suite, ceph_branch,
+                kernel_branch or '-', kernel_flavor, worker
+            ]
+        )
+
+    @staticmethod
+    def create_initial_config(suite, suite_branch, ceph_branch, ceph_sha1,
+                              teuthology_branch, kernel_branch, kernel_flavor,
+                              distro, machine_type, name=None):
+        """
+        Put together the config file used as the basis for each job in the run.
+        Grabs hashes for the latest ceph, kernel and teuthology versions in the
+        branches specified and specifies them so we know exactly what we're
+        testing.
+
+        :returns: A JobConfig object
+        """
+        # Put together a stanza specifying the kernel hash
+        if kernel_branch == 'distro':
+            kernel_hash = 'distro'
+        # Skip the stanza if no -k given
+        elif kernel_branch is None:
+            kernel_hash = None
+        else:
+            kernel_hash = get_gitbuilder_hash('kernel', kernel_branch,
+                                              kernel_flavor, machine_type,
+                                              distro)
+            if not kernel_hash:
+                schedule_fail(
+                    message="Kernel branch '{branch}' not found".format(
+                        branch=kernel_branch), name=name
+                )
+        if kernel_hash:
+            log.info("kernel sha1: {hash}".format(hash=kernel_hash))
+            kernel_dict = dict(kernel=dict(kdb=True, sha1=kernel_hash))
+            if kernel_hash is not 'distro':
+                kernel_dict['kernel']['flavor'] = kernel_flavor
+        else:
+            kernel_dict = dict()
+
+        # Get the ceph hash: if --sha1/-S is supplied, use it if
+        # it is valid, and just keep the ceph_branch around.
+        # Otherwise use the current git branch tip.
+
+        if ceph_sha1:
+            ceph_hash = git_validate_sha1('ceph', ceph_sha1)
+            if not ceph_hash:
+                exc = CommitNotFoundError(ceph_sha1, 'ceph.git')
+                schedule_fail(message=str(exc), name=name)
+            log.info("ceph sha1 explicitly supplied")
+
+        elif ceph_branch:
+            ceph_hash = git_ls_remote('ceph', ceph_branch)
+            if not ceph_hash:
+                exc = BranchNotFoundError(ceph_branch, 'ceph.git')
+                schedule_fail(message=str(exc), name=name)
+
+        log.info("ceph sha1: {hash}".format(hash=ceph_hash))
+
+        if config.suite_verify_ceph_hash:
+            # Get the ceph package version
+            ceph_version = package_version_for_hash(ceph_hash, kernel_flavor,
+                                                    distro, machine_type)
+            if not ceph_version:
+                schedule_fail(
+                    "Packages for ceph hash '{ver}' not found".format(
+                        ver=ceph_hash), name)
+            log.info("ceph version: {ver}".format(ver=ceph_version))
+        else:
+            log.info('skipping ceph package verification')
+
+        if teuthology_branch and teuthology_branch != 'master':
+            if not git_branch_exists('teuthology', teuthology_branch):
+                exc = BranchNotFoundError(teuthology_branch, 'teuthology.git')
+                schedule_fail(message=str(exc), name=name)
+        elif not teuthology_branch:
+            # Decide what branch of teuthology to use
+            if git_branch_exists('teuthology', ceph_branch):
+                teuthology_branch = ceph_branch
+            else:
+                log.info(
+                    "branch {0} not in teuthology.git; will use master for"
+                    " teuthology".format(ceph_branch))
+                teuthology_branch = 'master'
+        log.info("teuthology branch: %s", teuthology_branch)
+
+        if suite_branch and suite_branch != 'master':
+            if not git_branch_exists('ceph-qa-suite', suite_branch):
+                exc = BranchNotFoundError(suite_branch, 'ceph-qa-suite.git')
+                schedule_fail(message=str(exc), name=name)
+        elif not suite_branch:
+            # Decide what branch of ceph-qa-suite to use
+            if git_branch_exists('ceph-qa-suite', ceph_branch):
+                suite_branch = ceph_branch
+            else:
+                log.info(
+                    "branch {0} not in ceph-qa-suite.git; will use master for"
+                    " ceph-qa-suite".format(ceph_branch))
+                suite_branch = 'master'
+        suite_hash = git_ls_remote('ceph-qa-suite', suite_branch)
+        if not suite_hash:
+            exc = BranchNotFoundError(suite_branch, 'ceph-qa-suite.git')
+            schedule_fail(message=str(exc), name=name)
+        log.info("ceph-qa-suite branch: %s %s", suite_branch, suite_hash)
+
+        config_input = dict(
+            suite=suite,
+            suite_branch=suite_branch,
+            suite_hash=suite_hash,
+            ceph_branch=ceph_branch,
+            ceph_hash=ceph_hash,
+            teuthology_branch=teuthology_branch,
+            machine_type=machine_type,
+            distro=distro,
+            archive_upload=config.archive_upload,
+            archive_upload_key=config.archive_upload_key,
+        )
+        conf_dict = substitute_placeholders(dict_templ, config_input)
+        conf_dict.update(kernel_dict)
+        job_config = JobConfig.from_dict(conf_dict)
+        return job_config
+
+
+class Job(object):
+    pass
+
 
 class WaitException(Exception):
     pass
 
+
 def wait(name, max_job_time, upload_url):
-    stale_job = max_job_time + WAIT_MAX_JOB_TIME
+    stale_job = max_job_time + Run.WAIT_MAX_JOB_TIME
     reporter = ResultsReporter()
     past_unfinished_jobs = []
-    progress = time()
+    progress = time.time()
     log.info("waiting for the suite to complete")
     log.debug("the list of unfinished jobs will be displayed "
-              "every " + str(WAIT_PAUSE / 60) + " minutes")
+              "every " + str(Run.WAIT_PAUSE / 60) + " minutes")
     exit_code = 0
     while True:
         jobs = reporter.get_jobs(name, fields=['job_id', 'status'])
@@ -157,15 +311,15 @@ def wait(name, max_job_time, upload_url):
             log.info("wait is done")
             break
         if (len(past_unfinished_jobs) == len(unfinished_jobs) and
-            time() - progress > stale_job):
+                time.time() - progress > stale_job):
             raise WaitException(
                 "no progress since " + str(config.max_job_time) +
-                " + " + str(WAIT_PAUSE) + " seconds")
+                " + " + str(Run.WAIT_PAUSE) + " seconds")
         if len(past_unfinished_jobs) != len(unfinished_jobs):
             past_unfinished_jobs = unfinished_jobs
-            progress = time()
-        sleep(WAIT_PAUSE)
-        job_ids = [ job['job_id'] for job in unfinished_jobs ]
+            progress = time.time()
+        time.sleep(Run.WAIT_PAUSE)
+        job_ids = [job['job_id'] for job in unfinished_jobs]
         log.debug('wait for jobs ' + str(job_ids))
     jobs = reporter.get_jobs(name, fields=['job_id', 'status',
                                            'description', 'log_href'])
@@ -178,24 +332,6 @@ def wait(name, max_job_time, upload_url):
             url = job['log_href']
         log.info(job['status'] + " " + url + " " + job['description'])
     return exit_code
-
-def make_run_name(suite, ceph_branch, kernel_branch, kernel_flavor,
-                  machine_type, user=None, timestamp=None):
-    """
-    Generate a run name based on the parameters. A run name looks like:
-        teuthology-2014-06-23_19:00:37-rados-dumpling-testing-basic-plana
-    """
-    if not user:
-        user = pwd.getpwuid(os.getuid()).pw_name
-    # We assume timestamp is a datetime.datetime object
-    if not timestamp:
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
-
-    worker = get_worker(machine_type)
-    return '-'.join(
-        [user, str(timestamp), suite, ceph_branch,
-         kernel_branch or '-', kernel_flavor, worker]
-    )
 
 
 def fetch_repos(branch, test_name):
@@ -222,117 +358,6 @@ def fetch_repos(branch, test_name):
     except BranchNotFoundError as exc:
         schedule_fail(message=str(exc), name=test_name)
     return suite_repo_path
-
-
-def create_initial_config(suite, suite_branch, ceph_branch, ceph_sha1,
-                          teuthology_branch, kernel_branch, kernel_flavor,
-                          distro, machine_type, name=None):
-    """
-    Put together the config file used as the basis for each job in the run.
-    Grabs hashes for the latest ceph, kernel and teuthology versions in the
-    branches specified and specifies them so we know exactly what we're
-    testing.
-
-    :returns: A JobConfig object
-    """
-    # Put together a stanza specifying the kernel hash
-    if kernel_branch == 'distro':
-        kernel_hash = 'distro'
-    # Skip the stanza if no -k given
-    elif kernel_branch is None:
-        kernel_hash = None
-    else:
-        kernel_hash = get_gitbuilder_hash('kernel', kernel_branch,
-                                          kernel_flavor, machine_type, distro)
-        if not kernel_hash:
-            schedule_fail(message="Kernel branch '{branch}' not found".format(
-                branch=kernel_branch), name=name)
-    if kernel_hash:
-        log.info("kernel sha1: {hash}".format(hash=kernel_hash))
-        kernel_dict = dict(kernel=dict(kdb=True, sha1=kernel_hash))
-        if kernel_hash is not 'distro':
-            kernel_dict['kernel']['flavor'] = kernel_flavor
-    else:
-        kernel_dict = dict()
-
-    # Get the ceph hash: if --sha1/-S is supplied, use it if
-    # it is valid, and just keep the ceph_branch around.
-    # Otherwise use the current git branch tip.
-
-    if ceph_sha1:
-        ceph_hash = git_validate_sha1('ceph', ceph_sha1)
-        if not ceph_hash:
-            exc = CommitNotFoundError(ceph_sha1, 'ceph.git')
-            schedule_fail(message=str(exc), name=name)
-        log.info("ceph sha1 explicitly supplied")
-
-    elif ceph_branch:
-        ceph_hash = git_ls_remote('ceph', ceph_branch)
-        if not ceph_hash:
-            exc = BranchNotFoundError(ceph_branch, 'ceph.git')
-            schedule_fail(message=str(exc), name=name)
-
-    log.info("ceph sha1: {hash}".format(hash=ceph_hash))
-
-    if config.suite_verify_ceph_hash:
-        # Get the ceph package version
-        ceph_version = package_version_for_hash(ceph_hash, kernel_flavor,
-                                                distro, machine_type)
-        if not ceph_version:
-            schedule_fail("Packages for ceph hash '{ver}' not found".format(
-                ver=ceph_hash), name)
-        log.info("ceph version: {ver}".format(ver=ceph_version))
-    else:
-        log.info('skipping ceph package verification')
-
-    if teuthology_branch and teuthology_branch != 'master':
-        if not git_branch_exists('teuthology', teuthology_branch):
-            exc = BranchNotFoundError(teuthology_branch, 'teuthology.git')
-            schedule_fail(message=str(exc), name=name)
-    elif not teuthology_branch:
-        # Decide what branch of teuthology to use
-        if git_branch_exists('teuthology', ceph_branch):
-            teuthology_branch = ceph_branch
-        else:
-            log.info("branch {0} not in teuthology.git; will use master for"
-                     " teuthology".format(ceph_branch))
-            teuthology_branch = 'master'
-    log.info("teuthology branch: %s", teuthology_branch)
-
-    if suite_branch and suite_branch != 'master':
-        if not git_branch_exists('ceph-qa-suite', suite_branch):
-            exc = BranchNotFoundError(suite_branch, 'ceph-qa-suite.git')
-            schedule_fail(message=str(exc), name=name)
-    elif not suite_branch:
-        # Decide what branch of ceph-qa-suite to use
-        if git_branch_exists('ceph-qa-suite', ceph_branch):
-            suite_branch = ceph_branch
-        else:
-            log.info("branch {0} not in ceph-qa-suite.git; will use master for"
-                     " ceph-qa-suite".format(ceph_branch))
-            suite_branch = 'master'
-    suite_hash = git_ls_remote('ceph-qa-suite', suite_branch)
-    if not suite_hash:
-        exc = BranchNotFoundError(suite_branch, 'ceph-qa-suite.git')
-        schedule_fail(message=str(exc), name=name)
-    log.info("ceph-qa-suite branch: %s %s", suite_branch, suite_hash)
-
-    config_input = dict(
-        suite=suite,
-        suite_branch=suite_branch,
-        suite_hash=suite_hash,
-        ceph_branch=ceph_branch,
-        ceph_hash=ceph_hash,
-        teuthology_branch=teuthology_branch,
-        machine_type=machine_type,
-        distro=distro,
-        archive_upload=config.archive_upload,
-        archive_upload_key=config.archive_upload_key,
-    )
-    conf_dict = substitute_placeholders(dict_templ, config_input)
-    conf_dict.update(kernel_dict)
-    job_config = JobConfig.from_dict(conf_dict)
-    return job_config
 
 
 def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
@@ -769,7 +794,7 @@ def schedule_suite(job_config,
         )
         if not dry_run and throttle:
             log.info("pause between jobs : --throttle " + str(throttle))
-            sleep(int(throttle))
+            time.sleep(int(throttle))
 
     count = len(jobs_to_schedule)
     missing_count = len(jobs_missing_packages)
