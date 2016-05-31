@@ -6,7 +6,7 @@ from mock import patch, Mock, DEFAULT, MagicMock
 from fake_fs import make_fake_fstools
 from teuthology import suite
 from scripts.suite import main
-from teuthology.config import config
+from teuthology.config import config, YamlConfig
 from teuthology.orchestra.opsys import OS
 
 import os
@@ -67,22 +67,34 @@ def git_repository(request):
     request.addfinalizer(fin)
     return d
 
-class TestSuiteOffline(object):
-    def test_name_timestamp_passed(self):
-        stamp = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
-        name = suite.Run.make_run_name('suite', 'ceph', 'kernel', 'flavor',
-                                   'mtype', timestamp=stamp)
-        assert str(stamp) in name
 
-    def test_name_timestamp_not_passed(self):
+class TestSuiteOffline(object):
+    def test_name(self):
+        conf = YamlConfig.from_dict(dict(
+            suite='suite',
+            ceph_branch='ceph',
+            kernel_branch='kernel',
+            kernel_flavor='flavor',
+            machine_type='mtype',
+        ))
         stamp = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
-        name = suite.Run.make_run_name('suite', 'ceph', 'kernel', 'flavor',
-                                   'mtype')
+        with patch.object(suite.Run, 'create_initial_config',
+                          return_value=dict()):
+            name = suite.Run(conf).make_run_name()
         assert str(stamp) in name
 
     def test_name_user(self):
-        name = suite.Run.make_run_name('suite', 'ceph', 'kernel', 'flavor',
-                                   'mtype', user='USER')
+        conf = YamlConfig.from_dict(dict(
+            suite='suite',
+            ceph_branch='ceph',
+            kernel_branch='kernel',
+            kernel_flavor='flavor',
+            machine_type='mtype',
+            user='USER',
+        ))
+        with patch.object(suite.Run, 'create_initial_config',
+                          return_value=dict()):
+            name = suite.Run(conf).make_run_name()
         assert name.startswith('USER-')
 
     def test_substitute_placeholders(self):

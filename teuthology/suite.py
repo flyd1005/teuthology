@@ -21,7 +21,7 @@ from tempfile import NamedTemporaryFile
 import teuthology
 import matrix
 from . import lock
-from .config import config, JobConfig, FakeNamespace
+from .config import config, JobConfig, YamlConfig
 from .exceptions import BranchNotFoundError, CommitNotFoundError, ScheduleFailError
 from .misc import deep_merge, get_results_url
 from .orchestra.opsys import OS
@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 
 
 def process_args(args):
-    fn = FakeNamespace()
+    conf = YamlConfig()
     rename_args = {
         'ceph': 'ceph_branch',
         'sha1': 'ceph_sha1',
@@ -54,8 +54,8 @@ def process_args(args):
             value = value.replace('/', ':')
         elif key in ('limit', 'priority', 'num'):
             value = int(value)
-        fn[key] = value
-    return fn
+        conf[key] = value
+    return conf
 
 
 def main(args):
@@ -135,37 +135,31 @@ class Run(object):
 
     def __init__(self, args):
         """
-        args must be a config.FakeNamespace object
+        args must be a config.YamlConfig object
         """
-        self.name = self.make_run_name(
-            args.suite, args.ceph_branch, args.kernel_branch,
-            args.kernel_flavor, args.machine_type,
-        )
+        self.args = args
+        self.name = self.make_run_name()
         self.base_config = self.create_initial_config(
             args.suite, args.suite_branch, args.ceph_branch, args.ceph_sha1,
             args.teuthology_branch, args.kernel_branch, args.kernel_flavor,
             args.distro, args.machine_type, self.name,
         )
-        self.args = args
 
-    @staticmethod
-    def make_run_name(suite, ceph_branch, kernel_branch, kernel_flavor,
-                      machine_type, user=None, timestamp=None):
+    def make_run_name(self):
         """
-        Generate a run name based on the parameters. A run name looks like:
+        Generate a run name. A run name looks like:
             teuthology-2014-06-23_19:00:37-rados-dumpling-testing-basic-plana
         """
-        if not user:
-            user = pwd.getpwuid(os.getuid()).pw_name
+        user = self.args.user or pwd.getpwuid(os.getuid()).pw_name
         # We assume timestamp is a datetime.datetime object
-        if not timestamp:
-            timestamp = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+        timestamp = self.args.timestamp or \
+            datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
 
-        worker = get_worker(machine_type)
+        worker = get_worker(self.args.machine_type)
         return '-'.join(
             [
-                user, str(timestamp), suite, ceph_branch,
-                kernel_branch or '-', kernel_flavor, worker
+                user, str(timestamp), self.args.suite, self.args.ceph_branch,
+                self.args.kernel_branch or '-', self.args.kernel_flavor, worker
             ]
         )
 
