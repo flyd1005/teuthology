@@ -22,7 +22,8 @@ import teuthology
 import matrix
 from . import lock
 from .config import config, JobConfig, YamlConfig
-from .exceptions import BranchNotFoundError, CommitNotFoundError, ScheduleFailError
+from .exceptions import (BranchNotFoundError, CommitNotFoundError,
+                         ScheduleFailError)
 from .misc import deep_merge, get_results_url
 from .orchestra.opsys import OS
 from .packaging import GitbuilderProject
@@ -616,7 +617,7 @@ def git_validate_sha1(project, sha1, project_owner='ceph'):
     elif '/git.ceph.com/' in url:
         # kinda specific to knowing git.ceph.com is gitweb
         url = ('http://git.ceph.com/?p=%s.git;a=blob_plain;f=.gitignore;hb=%s'
-                    % (project, sha1))
+               % (project, sha1))
     else:
         raise RuntimeError(
             'git_validate_sha1: how do I check %s for a sha1?' % url
@@ -641,11 +642,13 @@ def build_git_url(project, project_owner='ceph'):
     url_templ = re.sub('\.git$', '', base)
     return url_templ.format(project_owner=project_owner, project=project)
 
+
 def git_branch_exists(project, branch, project_owner='ceph'):
     """
     Query the git repository to check the existence of a project's branch
     """
-    return git_ls_remote(project, branch, project_owner) != None
+    return git_ls_remote(project, branch, project_owner) is not None
+
 
 def get_branch_info(project, branch, project_owner='ceph'):
     """
@@ -668,6 +671,7 @@ def get_branch_info(project, branch, project_owner='ceph'):
     if resp.ok:
         return resp.json()
 
+
 def strip_fragment_path(original_path):
     """
     Given a path, remove the text before '/suites/'.  Part of the fix for
@@ -678,6 +682,7 @@ def strip_fragment_path(original_path):
     if scan_start > 0:
         return original_path[scan_start + len(scan_after):]
     return original_path
+
 
 def schedule_suite(job_config,
                    path,
@@ -722,7 +727,9 @@ def schedule_suite(job_config,
             if not any([x in description for x in filter_list]):
                 all_filt = []
                 for filt_samp in filter_list:
-                    all_filt.extend([x.find(filt_samp) < 0 for x in base_frag_paths])
+                    all_filt.extend(
+                        [x.find(filt_samp) < 0 for x in base_frag_paths]
+                    )
                 if all(all_filt):
                     continue
         if filter_out:
@@ -1027,6 +1034,7 @@ def generate_combinations(path, mat, generate_from, generate_to):
             matrix.generate_paths(path, output, combine_path)))
     return ret
 
+
 def build_matrix(path, subset=None):
     """
     Return a list of items descibed by path such that if the list of
@@ -1066,6 +1074,7 @@ def build_matrix(path, subset=None):
     mat, first, matlimit = _get_matrix(path, subset)
     return generate_combinations(path, mat, first, matlimit)
 
+
 def _get_matrix(path, subset=None):
     mat = None
     first = None
@@ -1083,6 +1092,7 @@ def _get_matrix(path, subset=None):
         mat = _build_matrix(path)
         matlimit = mat.size()
     return mat, first, matlimit
+
 
 def _build_matrix(path, mincyclicity=0, item=''):
     if not os.path.exists(path):
@@ -1123,8 +1133,8 @@ def _build_matrix(path, mincyclicity=0, item=''):
             mat = matrix.Product(item, submats)
             if mat and mat.cyclicity() < mincyclicity:
                 mat = matrix.Cycle(
-                (mincyclicity + mat.cyclicity() - 1) / mat.cyclicity(),
-                mat)
+                    (mincyclicity + mat.cyclicity() - 1) / mat.cyclicity(), mat
+                )
             return mat
         else:
             # list items
