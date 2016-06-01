@@ -69,34 +69,6 @@ def git_repository(request):
 
 
 class TestSuiteOffline(object):
-    def test_name(self):
-        conf = YamlConfig.from_dict(dict(
-            suite='suite',
-            ceph_branch='ceph',
-            kernel_branch='kernel',
-            kernel_flavor='flavor',
-            machine_type='mtype',
-        ))
-        stamp = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
-        with patch.object(suite.Run, 'create_initial_config',
-                          return_value=dict()):
-            name = suite.Run(conf).make_run_name()
-        assert str(stamp) in name
-
-    def test_name_user(self):
-        conf = YamlConfig.from_dict(dict(
-            suite='suite',
-            ceph_branch='ceph',
-            kernel_branch='kernel',
-            kernel_flavor='flavor',
-            machine_type='mtype',
-            user='USER',
-        ))
-        with patch.object(suite.Run, 'create_initial_config',
-                          return_value=dict()):
-            name = suite.Run(conf).make_run_name()
-        assert name.startswith('USER-')
-
     def test_substitute_placeholders(self):
         suite_hash = 'suite_hash'
         input_dict = dict(
@@ -289,8 +261,25 @@ class TestRun(object):
             kernel_flavor='kernel_flavor',
             distro='ubuntu',
             machine_type='machine_type',
+            base_yaml_paths=list(),
         )
         self.args = suite.YamlConfig.from_dict(self.args_dict)
+
+    @patch('teuthology.suite.fetch_repos')
+    def test_name(self, m_fetch_repos):
+        stamp = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+        with patch.object(suite.Run, 'create_initial_config',
+                          return_value=suite.JobConfig()):
+            name = suite.Run(self.args).name
+        assert str(stamp) in name
+
+    @patch('teuthology.suite.fetch_repos')
+    def test_name_user(self, m_fetch_repos):
+        self.args.user = 'USER'
+        with patch.object(suite.Run, 'create_initial_config',
+                          return_value=suite.JobConfig()):
+            name = suite.Run(self.args).name
+        assert name.startswith('USER-')
 
     @patch('teuthology.suite.git_branch_exists')
     @patch('teuthology.suite.package_version_for_hash')
@@ -315,6 +304,7 @@ class TestRun(object):
         with pytest.raises(suite.ScheduleFailError):
             self.klass(self.args)
 
+    @patch('teuthology.suite.fetch_repos')
     @patch('requests.head')
     @patch('teuthology.suite.git_branch_exists')
     @patch('teuthology.suite.package_version_for_hash')
@@ -325,6 +315,7 @@ class TestRun(object):
         m_package_version_for_hash,
         m_git_branch_exists,
         m_requests_head,
+        m_fetch_repos,
     ):
         config.gitbuilder_host = 'example.com'
         m_package_version_for_hash.return_value = 'ceph_hash'
@@ -1028,16 +1019,16 @@ def test_wait_fails(m_get_jobs):
         suite.wait('name', 1, None)
         assert 'abc' in str(error)
 
-class TestSuiteMain(object):
 
+class TestSuiteMain(object):
     def test_main(self):
         suite_name = 'SUITE'
         throttle = '3'
         machine_type = 'burnupi'
 
-        def prepare_and_schedule(**kwargs):
-            assert kwargs['job_config']['suite'] == suite_name
-            assert kwargs['throttle'] == throttle
+        def prepare_and_schedule(obj):
+            assert obj.base_config.suite == suite_name
+            assert obj.args.throttle == throttle
 
         def fake_str(*args, **kwargs):
             return 'fake'
@@ -1048,15 +1039,19 @@ class TestSuiteMain(object):
         with patch.multiple(
                 suite,
                 fetch_repos=DEFAULT,
-                prepare_and_schedule=prepare_and_schedule,
                 package_version_for_hash=fake_str,
                 git_branch_exists=fake_bool,
                 git_ls_remote=fake_str,
                 ):
-            main(['--suite', suite_name,
-                  '--throttle', throttle,
-                  '--machine-type', machine_type,
-                  ])
+            with patch.multiple(
+                suite.Run,
+                prepare_and_schedule=prepare_and_schedule,
+            ):
+                main([
+                    '--suite', suite_name,
+                    '--throttle', throttle,
+                    '--machine-type', machine_type,
+                ])
 
     def test_schedule_suite(self):
         suite_name = 'noop'

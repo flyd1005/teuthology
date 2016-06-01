@@ -86,11 +86,6 @@ def main(args):
     job_config = run.base_config
     name = run.name
 
-    if fn.suite_dir:
-        suite_repo_path = fn.suite_dir
-    else:
-        suite_repo_path = fetch_repos(job_config.suite_branch, test_name=name)
-
     job_config.name = name
     job_config.priority = fn.priority
     if config.results_email:
@@ -101,29 +96,12 @@ def main(args):
     if fn.dry_run:
         log.debug("Base job config:\n%s" % job_config)
 
-    # Interpret any relative paths as being relative to ceph-qa-suite (absolute
-    # paths are unchanged by this)
-    base_yaml_paths = [os.path.join(suite_repo_path, b) for b in
-                       fn.base_yaml_paths]
-
     with NamedTemporaryFile(prefix='schedule_suite_',
                             delete=False) as base_yaml:
         base_yaml.write(str(job_config))
         base_yaml_path = base_yaml.name
-    base_yaml_paths.insert(0, base_yaml_path)
-    prepare_and_schedule(job_config=job_config,
-                         suite_repo_path=suite_repo_path,
-                         base_yaml_paths=base_yaml_paths,
-                         limit=fn.limit,
-                         num=fn.num,
-                         timeout=fn.timeout,
-                         dry_run=fn.dry_run,
-                         verbose=fn.verbose,
-                         filter_in=fn.filter_in,
-                         filter_out=fn.filter_out,
-                         subset=subset,
-                         throttle=fn.throttle,
-                         )
+    run.base_yaml_paths.insert(0, base_yaml_path)
+    run.prepare_and_schedule()
     os.remove(base_yaml_path)
     if not fn.dry_run and args['--wait']:
         return wait(name, config.max_job_time,
@@ -133,6 +111,9 @@ def main(args):
 class Run(object):
     WAIT_MAX_JOB_TIME = 30 * 60
     WAIT_PAUSE = 5 * 60
+    __slots__ = (
+        'args', 'name', 'base_config', 'suite_repo_path', 'base_yaml_paths',
+    )
 
     def __init__(self, args):
         """
@@ -141,6 +122,17 @@ class Run(object):
         self.args = args
         self.name = self.make_run_name()
         self.base_config = self.create_initial_config()
+
+        if self.args.suite_dir:
+            self.suite_repo_path = self.args.suite_dir
+        else:
+            self.suite_repo_path = fetch_repos(self.base_config.suite_branch,
+                                               test_name=self.name)
+
+        # Interpret any relative paths as being relative to ceph-qa-suite
+        # (absolute paths are unchanged by this)
+        self.base_yaml_paths = [os.path.join(self.suite_repo_path, b) for b in
+                                self.args.base_yaml_paths]
 
     def make_run_name(self):
         """
@@ -303,74 +295,72 @@ class Run(object):
             schedule_fail(message=str(exc), name=self.name)
         log.info("ceph-qa-suite branch: %s %s", suite_branch, suite_hash)
 
+    def build_base_args(self):
+        base_args = [
+            '--name', self.name,
+            '--num', str(self.args.num),
+            '--worker', get_worker(self.args.machine_type),
+        ]
+        if self.args.dry_run:
+            base_args.append('--dry-run')
+        if self.args.priority is not None:
+            base_args.extend(['--priority', str(self.args.priority)])
+        if self.args.verbose:
+            base_args.append('-v')
+        if self.args.owner:
+            base_args.extend(['--owner', self.args.owner])
+        return base_args
 
-def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
-                         num, timeout, dry_run, verbose,
-                         filter_in,
-                         filter_out,
-                         subset,
-                         throttle):
-    """
-    Puts together some "base arguments" with which to execute
-    teuthology-schedule for each job, then passes them and other parameters to
-    schedule_suite(). Finally, schedules a "last-in-suite" job that sends an
-    email to the specified address (if one is configured).
-    """
-    arch = get_arch(job_config.machine_type)
+    def prepare_and_schedule(self):
+        """
+        Puts together some "base arguments" with which to execute
+        teuthology-schedule for each job, then passes them and other parameters
+        to schedule_suite(). Finally, schedules a "last-in-suite" job that
+        sends an email to the specified address (if one is configured).
+        """
+        arch = get_arch(self.base_config.machine_type)
+        base_args = self.build_base_args()
 
-    base_args = [
-        '--name', job_config.name,
-        '--num', str(num),
-        '--worker', get_worker(job_config.machine_type),
-    ]
-    if dry_run:
-        base_args.append('--dry-run')
-    if job_config.priority is not None:
-        base_args.extend(['--priority', str(job_config.priority)])
-    if verbose:
-        base_args.append('-v')
-    if job_config.owner:
-        base_args.extend(['--owner', job_config.owner])
+        suite_path = os.path.join(
+            self.suite_repo_path, 'suites',
+            self.base_config.suite.replace(':', '/'))
 
-    suite_path = os.path.join(suite_repo_path, 'suites',
-                              job_config.suite.replace(':', '/'))
+        # Make sure the yaml paths are actually valid
+        for yaml_path in self.base_yaml_paths:
+            full_yaml_path = os.path.join(self.suite_repo_path, yaml_path)
+            if not os.path.exists(full_yaml_path):
+                raise IOError("File not found: " + full_yaml_path)
 
-    # Make sure the yaml paths are actually valid
-    for yaml_path in base_yaml_paths:
-        full_yaml_path = os.path.join(suite_repo_path, yaml_path)
-        if not os.path.exists(full_yaml_path):
-            raise IOError("File not found: " + full_yaml_path)
-
-    num_jobs = schedule_suite(
-        job_config=job_config,
-        path=suite_path,
-        base_yamls=base_yaml_paths,
-        base_args=base_args,
-        arch=arch,
-        limit=limit,
-        dry_run=dry_run,
-        verbose=verbose,
-        filter_in=filter_in,
-        filter_out=filter_out,
-        subset=subset,
-        throttle=throttle
-    )
-
-    if job_config.email and num_jobs:
-        arg = copy.deepcopy(base_args)
-        arg.append('--last-in-suite')
-        arg.extend(['--email', job_config.email])
-        if timeout:
-            arg.extend(['--timeout', timeout])
-        teuthology_schedule(
-            args=arg,
-            dry_run=dry_run,
-            verbose=verbose,
-            log_prefix="Results email: ",
+        num_jobs = schedule_suite(
+            job_config=self.base_config,
+            path=suite_path,
+            base_yamls=self.base_yaml_paths,
+            base_args=base_args,
+            arch=arch,
+            limit=self.args.limit,
+            dry_run=self.args.dry_run,
+            verbose=self.args.verbose,
+            filter_in=self.args.filter_in,
+            filter_out=self.args.filter_out,
+            subset=self.args.subset,
+            throttle=self.args.throttle,
         )
-        results_url = get_results_url(job_config.name)
-        if results_url:
-            log.info("Test results viewable at %s", results_url)
+
+        if self.base_config.email and num_jobs:
+            arg = copy.deepcopy(base_args)
+            arg.append('--last-in-suite')
+            arg.extend(['--email', self.base_config.email])
+            if self.args.timeout:
+                arg.extend(['--timeout', self.args.timeout])
+            teuthology_schedule(
+                args=arg,
+                dry_run=self.args.dry_run,
+                verbose=self.args.verbose,
+                log_prefix="Results email: ",
+            )
+            results_url = get_results_url(self.base_config.name)
+            if results_url:
+                log.info("Test results viewable at %s", results_url)
 
 
 def schedule_suite(job_config,
