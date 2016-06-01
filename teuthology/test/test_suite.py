@@ -222,6 +222,7 @@ class TestSuiteOffline(object):
         assert None == suite.git_ls_remote('ceph', 'nobranch')
         assert suite.git_ls_remote('ceph', 'master') is not None
 
+
 class TestFlavor(object):
     def test_get_install_task_flavor_bare(self):
         config = dict(
@@ -273,6 +274,24 @@ class TestFlavor(object):
         )
         assert suite.get_install_task_flavor(config) == 'notcmalloc'
 
+
+class TestRun(object):
+    klass = suite.Run
+
+    def setup(self):
+        self.args_dict = dict(
+            suite='suite',
+            suite_branch='suite_branch',
+            ceph_branch='ceph_branch',
+            ceph_sha1='ceph_sha1',
+            teuthology_branch='teuthology_branch',
+            kernel_branch=None,
+            kernel_flavor='kernel_flavor',
+            distro='ubuntu',
+            machine_type='machine_type',
+        )
+        self.args = suite.YamlConfig.from_dict(self.args_dict)
+
     @patch('teuthology.suite.git_branch_exists')
     @patch('teuthology.suite.package_version_for_hash')
     @patch('teuthology.suite.git_ls_remote')
@@ -291,12 +310,10 @@ class TestFlavor(object):
         ]
         m_package_version_for_hash.return_value = 'a_version'
         m_git_branch_exists.return_value = True
+        self.args.ceph_branch = 'ceph_sha1'
+        self.args.ceph_sha1 = None
         with pytest.raises(suite.ScheduleFailError):
-            suite.Run.create_initial_config(
-                'suite', 'suite_branch', 'ceph_hash', None,
-                'teuth_branch', None, 'kernel_flavor', 'ubuntu',
-                'machine_type',
-            )
+            self.klass(self.args)
 
     @patch('requests.head')
     @patch('teuthology.suite.git_branch_exists')
@@ -318,12 +335,9 @@ class TestFlavor(object):
         m_requests_head.return_value = resp
         # only one call to git_ls_remote in this case
         m_git_ls_remote.return_value = "suite_branch"
-        result = suite.Run.create_initial_config(
-            'suite', 'suite_branch', 'ceph_branch', 'ceph_hash',
-            'teuth_branch', None, 'kernel_flavor', 'ubuntu', 'machine_type',
-        )
-        assert result.sha1 == 'ceph_hash'
-        assert result.branch == 'ceph_branch'
+        run = self.klass(self.args)
+        assert run.base_config.sha1 == 'ceph_sha1'
+        assert run.base_config.branch == 'ceph_branch'
 
     @patch('requests.head')
     @patch('teuthology.suite.git_branch_exists')
@@ -341,12 +355,10 @@ class TestFlavor(object):
         resp.reason = 'Not Found'
         resp.status_code = 404
         m_requests_head.return_value = resp
+        self.args.ceph_sha1 = 'ceph_hash_dne'
         with pytest.raises(suite.ScheduleFailError):
-            suite.Run.create_initial_config(
-                'suite', 'suite_branch', 'ceph_branch', 'ceph_hash_dne',
-                'teuth_branch', None, 'kernel_flavor', 'ubuntu',
-                'machine_type',
-            )
+            self.klass(self.args)
+
 
 class TestMissingPackages(object):
     """
