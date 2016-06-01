@@ -347,35 +347,7 @@ class Run(object):
 
     def schedule_suite(self):
         """
-    def schedule_suite(job_config,
-                    path,
-                    base_yamls,
-                    base_args,
-                    arch,
-                    limit=0,
-                    dry_run=True,
-                    verbose=1,
-                    filter_in=None,
-                    filter_out=None,
-                    subset=None,
-                    throttle=None,
-                    ):
-        schedule one suite.
-        returns number of jobs scheduled
-        """
-        """
-        job_config=self.base_config,
-        path=suite_path,
-        base_yamls=self.base_yaml_paths,
-        base_args=base_args,
-        arch=arch,
-        limit=self.args.limit,
-        dry_run=self.args.dry_run,
-        verbose=self.args.verbose,
-        filter_in=self.args.filter_in,
-        filter_out=self.args.filter_out,
-        subset=self.args.subset,
-        throttle=self.args.throttle,
+        Schedule the suite-run. Returns the number of jobs scheduled.
         """
         name = self.name
         arch = get_arch(self.base_config.machine_type)
