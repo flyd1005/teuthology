@@ -304,6 +304,227 @@ class Run(object):
         log.info("ceph-qa-suite branch: %s %s", suite_branch, suite_hash)
 
 
+def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
+                         num, timeout, dry_run, verbose,
+                         filter_in,
+                         filter_out,
+                         subset,
+                         throttle):
+    """
+    Puts together some "base arguments" with which to execute
+    teuthology-schedule for each job, then passes them and other parameters to
+    schedule_suite(). Finally, schedules a "last-in-suite" job that sends an
+    email to the specified address (if one is configured).
+    """
+    arch = get_arch(job_config.machine_type)
+
+    base_args = [
+        '--name', job_config.name,
+        '--num', str(num),
+        '--worker', get_worker(job_config.machine_type),
+    ]
+    if dry_run:
+        base_args.append('--dry-run')
+    if job_config.priority is not None:
+        base_args.extend(['--priority', str(job_config.priority)])
+    if verbose:
+        base_args.append('-v')
+    if job_config.owner:
+        base_args.extend(['--owner', job_config.owner])
+
+    suite_path = os.path.join(suite_repo_path, 'suites',
+                              job_config.suite.replace(':', '/'))
+
+    # Make sure the yaml paths are actually valid
+    for yaml_path in base_yaml_paths:
+        full_yaml_path = os.path.join(suite_repo_path, yaml_path)
+        if not os.path.exists(full_yaml_path):
+            raise IOError("File not found: " + full_yaml_path)
+
+    num_jobs = schedule_suite(
+        job_config=job_config,
+        path=suite_path,
+        base_yamls=base_yaml_paths,
+        base_args=base_args,
+        arch=arch,
+        limit=limit,
+        dry_run=dry_run,
+        verbose=verbose,
+        filter_in=filter_in,
+        filter_out=filter_out,
+        subset=subset,
+        throttle=throttle
+    )
+
+    if job_config.email and num_jobs:
+        arg = copy.deepcopy(base_args)
+        arg.append('--last-in-suite')
+        arg.extend(['--email', job_config.email])
+        if timeout:
+            arg.extend(['--timeout', timeout])
+        teuthology_schedule(
+            args=arg,
+            dry_run=dry_run,
+            verbose=verbose,
+            log_prefix="Results email: ",
+        )
+        results_url = get_results_url(job_config.name)
+        if results_url:
+            log.info("Test results viewable at %s", results_url)
+
+
+def schedule_suite(job_config,
+                   path,
+                   base_yamls,
+                   base_args,
+                   arch,
+                   limit=0,
+                   dry_run=True,
+                   verbose=1,
+                   filter_in=None,
+                   filter_out=None,
+                   subset=None,
+                   throttle=None,
+                   ):
+    """
+    schedule one suite.
+    returns number of jobs scheduled
+    """
+    suite_name = job_config.suite
+    name = job_config.name
+    log.debug('Suite %s in %s' % (suite_name, path))
+    configs = [(combine_path(suite_name, item[0]), item[1]) for item in
+               build_matrix(path, subset=subset)]
+    log.info('Suite %s in %s generated %d jobs (not yet filtered)' % (
+        suite_name, path, len(configs)))
+
+    # used as a local cache for package versions from gitbuilder
+    package_versions = dict()
+    jobs_to_schedule = []
+    jobs_missing_packages = []
+    for description, fragment_paths in configs:
+        base_frag_paths = [strip_fragment_path(x) for x in fragment_paths]
+        if limit > 0 and len(jobs_to_schedule) >= limit:
+            log.info(
+                'Stopped after {limit} jobs due to --limit={limit}'.format(
+                    limit=limit))
+            break
+        # Break apart the filter parameter (one string) into comma separated
+        # components to be used in searches.
+        if filter_in:
+            filter_list = [x.strip() for x in filter_in.split(',')]
+            if not any([x in description for x in filter_list]):
+                all_filt = []
+                for filt_samp in filter_list:
+                    all_filt.extend(
+                        [x.find(filt_samp) < 0 for x in base_frag_paths]
+                    )
+                if all(all_filt):
+                    continue
+        if filter_out:
+            filter_list = [x.strip() for x in filter_out.split(',')]
+            if any([x in description for x in filter_list]):
+                continue
+            all_filt_val = False
+            for filt_samp in filter_list:
+                flist = [filt_samp in x for x in base_frag_paths]
+                if any(flist):
+                    all_filt_val = True
+                    continue
+            if all_filt_val:
+                continue
+
+        raw_yaml = '\n'.join([file(a, 'r').read() for a in fragment_paths])
+
+        parsed_yaml = yaml.load(raw_yaml)
+        os_type = parsed_yaml.get('os_type') or job_config.os_type
+        exclude_arch = parsed_yaml.get('exclude_arch')
+        exclude_os_type = parsed_yaml.get('exclude_os_type')
+
+        if exclude_arch and exclude_arch == arch:
+            log.info('Skipping due to excluded_arch: %s facets %s',
+                     exclude_arch, description)
+            continue
+        if exclude_os_type and exclude_os_type == os_type:
+            log.info('Skipping due to excluded_os_type: %s facets %s',
+                     exclude_os_type, description)
+            continue
+
+        arg = copy.deepcopy(base_args)
+        arg.extend([
+            '--description', description,
+            '--',
+        ])
+        arg.extend(base_yamls)
+        arg.extend(fragment_paths)
+
+        job = dict(
+            yaml=parsed_yaml,
+            desc=description,
+            sha1=job_config.sha1,
+            args=arg
+        )
+
+        if config.suite_verify_ceph_hash:
+            full_job_config = dict()
+            deep_merge(full_job_config, job_config.to_dict())
+            deep_merge(full_job_config, parsed_yaml)
+            flavor = get_install_task_flavor(full_job_config)
+            sha1 = job_config.sha1
+            # Get package versions for this sha1, os_type and flavor. If we've
+            # already retrieved them in a previous loop, they'll be present in
+            # package_versions and gitbuilder will not be asked again for them.
+            package_versions = get_package_versions(
+                sha1,
+                os_type,
+                flavor,
+                package_versions
+            )
+            if not has_packages_for_distro(sha1, os_type, flavor,
+                                           package_versions):
+                m = "Packages for os_type '{os}', flavor {flavor} and " + \
+                    "ceph hash '{ver}' not found"
+                log.error(m.format(os=os_type, flavor=flavor, ver=sha1))
+                jobs_missing_packages.append(job)
+
+        jobs_to_schedule.append(job)
+
+    for job in jobs_to_schedule:
+        log.info(
+            'Scheduling %s', job['desc']
+        )
+
+        log_prefix = ''
+        if job in jobs_missing_packages:
+            log_prefix = "Missing Packages: "
+            if not dry_run and not config.suite_allow_missing_packages:
+                schedule_fail(
+                    "At least one job needs packages that don't exist for hash"
+                    " {sha1}.".format(sha1=job_config.sha1),
+                    name,
+                )
+        teuthology_schedule(
+            args=job['args'],
+            dry_run=dry_run,
+            verbose=verbose,
+            log_prefix=log_prefix,
+        )
+        if not dry_run and throttle:
+            log.info("pause between jobs : --throttle " + str(throttle))
+            time.sleep(int(throttle))
+
+    count = len(jobs_to_schedule)
+    missing_count = len(jobs_missing_packages)
+    log.info('Suite %s in %s scheduled %d jobs.' % (suite_name, path, count))
+    log.info('%d/%d jobs were filtered out.',
+             (len(configs) - count),
+             len(configs))
+    if missing_count:
+        log.warn('Scheduled %d/%d jobs that are missing packages!',
+                 missing_count, count)
+    return count
+
+
 class Job(object):
     pass
 
@@ -380,75 +601,6 @@ def fetch_repos(branch, test_name):
     except BranchNotFoundError as exc:
         schedule_fail(message=str(exc), name=test_name)
     return suite_repo_path
-
-
-def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
-                         num, timeout, dry_run, verbose,
-                         filter_in,
-                         filter_out,
-                         subset,
-                         throttle):
-    """
-    Puts together some "base arguments" with which to execute
-    teuthology-schedule for each job, then passes them and other parameters to
-    schedule_suite(). Finally, schedules a "last-in-suite" job that sends an
-    email to the specified address (if one is configured).
-    """
-    arch = get_arch(job_config.machine_type)
-
-    base_args = [
-        '--name', job_config.name,
-        '--num', str(num),
-        '--worker', get_worker(job_config.machine_type),
-    ]
-    if dry_run:
-        base_args.append('--dry-run')
-    if job_config.priority is not None:
-        base_args.extend(['--priority', str(job_config.priority)])
-    if verbose:
-        base_args.append('-v')
-    if job_config.owner:
-        base_args.extend(['--owner', job_config.owner])
-
-    suite_path = os.path.join(suite_repo_path, 'suites',
-                              job_config.suite.replace(':', '/'))
-
-    # Make sure the yaml paths are actually valid
-    for yaml_path in base_yaml_paths:
-        full_yaml_path = os.path.join(suite_repo_path, yaml_path)
-        if not os.path.exists(full_yaml_path):
-            raise IOError("File not found: " + full_yaml_path)
-
-    num_jobs = schedule_suite(
-        job_config=job_config,
-        path=suite_path,
-        base_yamls=base_yaml_paths,
-        base_args=base_args,
-        arch=arch,
-        limit=limit,
-        dry_run=dry_run,
-        verbose=verbose,
-        filter_in=filter_in,
-        filter_out=filter_out,
-        subset=subset,
-        throttle=throttle
-    )
-
-    if job_config.email and num_jobs:
-        arg = copy.deepcopy(base_args)
-        arg.append('--last-in-suite')
-        arg.extend(['--email', job_config.email])
-        if timeout:
-            arg.extend(['--timeout', timeout])
-        teuthology_schedule(
-            args=arg,
-            dry_run=dry_run,
-            verbose=verbose,
-            log_prefix="Results email: ",
-        )
-        results_url = get_results_url(job_config.name)
-        if results_url:
-            log.info("Test results viewable at %s", results_url)
 
 
 def schedule_fail(message, name=''):
@@ -682,158 +834,6 @@ def strip_fragment_path(original_path):
     if scan_start > 0:
         return original_path[scan_start + len(scan_after):]
     return original_path
-
-
-def schedule_suite(job_config,
-                   path,
-                   base_yamls,
-                   base_args,
-                   arch,
-                   limit=0,
-                   dry_run=True,
-                   verbose=1,
-                   filter_in=None,
-                   filter_out=None,
-                   subset=None,
-                   throttle=None,
-                   ):
-    """
-    schedule one suite.
-    returns number of jobs scheduled
-    """
-    suite_name = job_config.suite
-    name = job_config.name
-    log.debug('Suite %s in %s' % (suite_name, path))
-    configs = [(combine_path(suite_name, item[0]), item[1]) for item in
-               build_matrix(path, subset=subset)]
-    log.info('Suite %s in %s generated %d jobs (not yet filtered)' % (
-        suite_name, path, len(configs)))
-
-    # used as a local cache for package versions from gitbuilder
-    package_versions = dict()
-    jobs_to_schedule = []
-    jobs_missing_packages = []
-    for description, fragment_paths in configs:
-        base_frag_paths = [strip_fragment_path(x) for x in fragment_paths]
-        if limit > 0 and len(jobs_to_schedule) >= limit:
-            log.info(
-                'Stopped after {limit} jobs due to --limit={limit}'.format(
-                    limit=limit))
-            break
-        # Break apart the filter parameter (one string) into comma separated
-        # components to be used in searches.
-        if filter_in:
-            filter_list = [x.strip() for x in filter_in.split(',')]
-            if not any([x in description for x in filter_list]):
-                all_filt = []
-                for filt_samp in filter_list:
-                    all_filt.extend(
-                        [x.find(filt_samp) < 0 for x in base_frag_paths]
-                    )
-                if all(all_filt):
-                    continue
-        if filter_out:
-            filter_list = [x.strip() for x in filter_out.split(',')]
-            if any([x in description for x in filter_list]):
-                continue
-            all_filt_val = False
-            for filt_samp in filter_list:
-                flist = [filt_samp in x for x in base_frag_paths]
-                if any(flist):
-                    all_filt_val = True
-                    continue
-            if all_filt_val:
-                continue
-
-        raw_yaml = '\n'.join([file(a, 'r').read() for a in fragment_paths])
-
-        parsed_yaml = yaml.load(raw_yaml)
-        os_type = parsed_yaml.get('os_type') or job_config.os_type
-        exclude_arch = parsed_yaml.get('exclude_arch')
-        exclude_os_type = parsed_yaml.get('exclude_os_type')
-
-        if exclude_arch and exclude_arch == arch:
-            log.info('Skipping due to excluded_arch: %s facets %s',
-                     exclude_arch, description)
-            continue
-        if exclude_os_type and exclude_os_type == os_type:
-            log.info('Skipping due to excluded_os_type: %s facets %s',
-                     exclude_os_type, description)
-            continue
-
-        arg = copy.deepcopy(base_args)
-        arg.extend([
-            '--description', description,
-            '--',
-        ])
-        arg.extend(base_yamls)
-        arg.extend(fragment_paths)
-
-        job = dict(
-            yaml=parsed_yaml,
-            desc=description,
-            sha1=job_config.sha1,
-            args=arg
-        )
-
-        if config.suite_verify_ceph_hash:
-            full_job_config = dict()
-            deep_merge(full_job_config, job_config.to_dict())
-            deep_merge(full_job_config, parsed_yaml)
-            flavor = get_install_task_flavor(full_job_config)
-            sha1 = job_config.sha1
-            # Get package versions for this sha1, os_type and flavor. If we've
-            # already retrieved them in a previous loop, they'll be present in
-            # package_versions and gitbuilder will not be asked again for them.
-            package_versions = get_package_versions(
-                sha1,
-                os_type,
-                flavor,
-                package_versions
-            )
-            if not has_packages_for_distro(sha1, os_type, flavor,
-                                           package_versions):
-                m = "Packages for os_type '{os}', flavor {flavor} and " + \
-                    "ceph hash '{ver}' not found"
-                log.error(m.format(os=os_type, flavor=flavor, ver=sha1))
-                jobs_missing_packages.append(job)
-
-        jobs_to_schedule.append(job)
-
-    for job in jobs_to_schedule:
-        log.info(
-            'Scheduling %s', job['desc']
-        )
-
-        log_prefix = ''
-        if job in jobs_missing_packages:
-            log_prefix = "Missing Packages: "
-            if not dry_run and not config.suite_allow_missing_packages:
-                schedule_fail(
-                    "At least one job needs packages that don't exist for hash"
-                    " {sha1}.".format(sha1=job_config.sha1),
-                    name,
-                )
-        teuthology_schedule(
-            args=job['args'],
-            dry_run=dry_run,
-            verbose=verbose,
-            log_prefix=log_prefix,
-        )
-        if not dry_run and throttle:
-            log.info("pause between jobs : --throttle " + str(throttle))
-            time.sleep(int(throttle))
-
-    count = len(jobs_to_schedule)
-    missing_count = len(jobs_missing_packages)
-    log.info('Suite %s in %s scheduled %d jobs.' % (suite_name, path, count))
-    log.info('%d/%d jobs were filtered out.',
-             (len(configs) - count),
-             len(configs))
-    if missing_count:
-        log.warn('Scheduled %d/%d jobs that are missing packages!',
-                 missing_count, count)
-    return count
 
 
 def teuthology_schedule(args, verbose, dry_run, log_prefix=''):
